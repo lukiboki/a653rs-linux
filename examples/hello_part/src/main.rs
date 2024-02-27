@@ -2,6 +2,8 @@ use a653rs::partition;
 use a653rs::prelude::PartitionExt;
 use a653rs_linux::partition::ApexLogger;
 use log::LevelFilter;
+mod beispiel_bojan;
+use beispiel_bojan::src::main;
 
 fn main() {
     ApexLogger::install_panic_hook();
@@ -15,7 +17,9 @@ mod hello {
     use core::time::Duration;
     use std::thread::sleep;
 
+    /*
     use a653rs_postcard::prelude::*;
+    */
     use humantime::format_duration;
     use log::*;
     use serde::{Deserialize, Serialize};
@@ -35,8 +39,8 @@ mod hello {
             ctx.create_hello_destination().unwrap();
         }
 
-        ctx.create_aperiodic().unwrap().start().unwrap();
-        ctx.create_periodic().unwrap().start().unwrap();
+        ctx.create_aperiodic_process().unwrap().start().unwrap();
+        ctx.create_periodic_process().unwrap().start().unwrap();
     }
 
     #[start(warm)]
@@ -50,8 +54,12 @@ mod hello {
         base_priority = 1,
         deadline = "Soft"
     )]
-    fn aperiodic(ctx: aperiodic::Context) {
-        info!("Start Aperiodic");
+    fn aperiodic_process(_ctx: aperiodic_process::Context) {
+        loop {
+            info!("Start Aperiodic");
+            sleep(Duration::from_millis(1));
+        }
+        /* 
         for i in 0..i32::MAX {
             if let SystemTime::Normal(time) = ctx.get_time() {
                 let round = Duration::from_millis(time.as_millis() as u64);
@@ -59,6 +67,7 @@ mod hello {
             }
             sleep(Duration::from_millis(1))
         }
+        */
     }
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -74,38 +83,26 @@ mod hello {
         base_priority = 1,
         deadline = "Soft"
     )]
-    fn periodic(ctx: periodic::Context) {
-        let ident = ctx.get_partition_status().identifier;
-        for i in 1..i32::MAX {
+    fn periodic_process(ctx: periodic_process::Context) {
+        loop {
+            info!("Start Periodic");
+            ctx.periodic_wait();
+        }
+        /* 
+        for i in 0..i32::MAX {
             if let SystemTime::Normal(time) = ctx.get_time() {
                 let round = Duration::from_millis(time.as_millis() as u64);
-                info!("{:?}: P MSG {i}", format_duration(round).to_string());
+                info!("{:?}: AP MSG {i}", format_duration(round).to_string());
             }
-            sleep(Duration::from_millis(1));
-
-            if i % 5 == 0 {
-                if ident == 0 {
-                    ctx.hello_source
-                        .unwrap()
-                        .send_type(CustomMessage {
-                            msg: format!("Sampling MSG {}", i / 5),
-                            when: ctx.get_time().unwrap_duration(),
-                        })
-                        .ok()
-                        .unwrap();
-                } else if ident == 1 {
-                    let (valid, data) = ctx
-                        .hello_destination
-                        .unwrap()
-                        .recv_type::<CustomMessage>()
-                        .ok()
-                        .unwrap();
-
-                    info!("Received via Sampling Port: {:?}, valid: {valid:?}", data)
-                }
-
-                ctx.periodic_wait().unwrap();
-            }
+            sleep(Duration::from_millis(1))
         }
+        */
+        /*
+        info!("Start Periodic");
+        use crate::main;
+        let calc_adv = main::calc_adv();
+        calc_adv;
+        println!("Test \n\n\n");
+        */
     }
 }

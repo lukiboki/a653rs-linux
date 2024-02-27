@@ -1,6 +1,5 @@
 use std::collections::HashSet;
 use std::convert::AsRef;
-use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::prelude::{AsRawFd, OwnedFd, RawFd};
 use std::time::Instant;
 
@@ -107,7 +106,7 @@ impl Sampling {
         let (dir, fd, port) = if self.source_port.partition.eq(part.as_ref()) {
             (
                 PortDirection::Source,
-                self.source_fd().as_raw_fd(),
+                self.source_fd(),
                 &self.source_port.port,
             )
         } else if let Some(port) = self
@@ -117,7 +116,7 @@ impl Sampling {
         {
             (
                 PortDirection::Destination,
-                self.destination_fd().as_raw_fd(),
+                self.destination_fd(),
                 &port.port,
             )
         } else {
@@ -198,12 +197,12 @@ impl Sampling {
         Ok(())
     }
 
-    pub fn source_fd(&self) -> BorrowedFd {
-        self.source.as_fd()
+    pub fn source_fd(&self) -> RawFd {
+        self.source.as_raw_fd()
     }
 
-    pub fn destination_fd(&self) -> BorrowedFd {
-        self.destination.as_fd()
+    pub fn destination_fd(&self) -> RawFd {
+        self.destination.as_raw_fd()
     }
 }
 

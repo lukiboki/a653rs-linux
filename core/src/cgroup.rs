@@ -233,7 +233,7 @@ pub fn mount_point() -> anyhow::Result<PathBuf> {
     // TODO: This is an awful old function, replace it!
     procfs::process::Process::myself()?
         .mountinfo()?
-        .into_iter()
+        .iter()
         .find(|m| m.fs_type.eq("cgroup2")) // TODO A process can have several cgroup mounts
         .ok_or_else(|| anyhow!("no cgroup2 mount found"))
         .map(|m| m.mount_point.clone())
@@ -244,8 +244,7 @@ pub fn mount_point() -> anyhow::Result<PathBuf> {
 pub fn current_cgroup() -> anyhow::Result<PathBuf> {
     let path = procfs::process::Process::myself()?
         .cgroups()?
-        .into_iter()
-        .next()
+        .first()
         .ok_or(anyhow!("cannot obtain cgroup"))?
         .pathname
         .clone();

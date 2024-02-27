@@ -7,16 +7,14 @@ use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;
 
-use anyhow::anyhow;
-use clap::Parser;
-use nix::sys::signal::*;
-
 use a653rs_linux_core::cgroup;
 use a653rs_linux_core::error::{ErrorLevel, LeveledResult, ResultExt, SystemError, TypedResultExt};
 use a653rs_linux_core::health::ModuleRecoveryAction;
+use anyhow::anyhow;
+use clap::Parser;
 use hypervisor::config::Config;
-
-use crate::hypervisor::Hypervisor;
+use hypervisor::linux::Hypervisor;
+use nix::sys::signal::*;
 
 pub mod hypervisor;
 
@@ -68,8 +66,13 @@ pub fn run_hypervisor() -> LeveledResult<()> {
         let cgroups = my_pid
             .cgroups()
             .expect("unable to retrieve my parent cgroup");
-        let cgroups = cgroups.into_iter().find(|c| c.hierarchy == 0).unwrap();
-        let cgroup_path = cgroups.pathname.strip_prefix('/').unwrap(); // this can't fail, the cgroup reported will always start with a leading '/'
+        let cgroup_path = cgroups
+            .iter()
+            .find(|c| c.hierarchy == 0)
+            .unwrap()
+            .pathname
+            .strip_prefix('/')
+            .unwrap(); // this can't fail, the cgroup reported will always start with a leading '/'
         cgroups_mount_point.join(cgroup_path)
     });
     // Add Additional cgroup layer
@@ -161,9 +164,8 @@ macro_rules! problem {
 
 #[cfg(test)]
 mod test {
-    use anyhow::anyhow;
-
     use a653rs_linux_core::error::{SystemError, TypedError, TypedResult};
+    use anyhow::anyhow;
 
     fn problem_manual() -> TypedResult<()> {
         let extra_info = "problem";

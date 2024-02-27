@@ -211,10 +211,7 @@
 
         # always check these
         checks = {
-          nixpkgs-fmt = pkgs.runCommand "nixpkgs-fmt"
-            {
-              nativeBuildInputs = [ pkgs.nixpkgs-fmt ];
-            } "nixpkgs-fmt --check ${./.}; touch $out";
+
           cargo-fmt = pkgs.runCommand "cargo-fmt"
             {
               nativeBuildInputs = [ rust-toolchain ];

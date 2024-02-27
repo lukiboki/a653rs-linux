@@ -1,43 +1,41 @@
 //! Implementation of the mechanism to perform system calls
 
 use std::io::IoSliceMut;
-use std::num::NonZeroUsize;
-use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::RawFd;
 use std::time::{Duration, Instant};
 
 use a653rs_linux_core::mfd::{Mfd, Seals};
 use a653rs_linux_core::syscall::{SyscallRequ, SyscallResp};
-use anyhow::{anyhow, bail, Result};
+use anyhow::{bail, Result};
 use libc::EINTR;
 use nix::sys::socket::{recvmsg, ControlMessageOwned, MsgFlags};
 use nix::{cmsg_space, unistd};
-use polling::{Event, Events, Poller};
+use polling::{Event, Poller};
 
 /// Receives an FD triple from fd
 // TODO: Use generics here
-fn recv_fd_triple(fd: BorrowedFd) -> Result<[OwnedFd; 3]> {
+fn recv_fd_triple(fd: RawFd) -> Result<[RawFd; 3]> {
     let mut cmsg = cmsg_space!([RawFd; 3]);
     let mut iobuf = [0u8];
     let mut iov = [IoSliceMut::new(&mut iobuf)];
-    let res = recvmsg::<()>(fd.as_raw_fd(), &mut iov, Some(&mut cmsg), MsgFlags::empty())?;
+    let res = recvmsg::<()>(fd, &mut iov, Some(&mut cmsg), MsgFlags::empty())?;
 
     let fds: Vec<RawFd> = match res.cmsgs().next().unwrap() {
         ControlMessageOwned::ScmRights(fds) => fds,
         _ => bail!("received an unknown cmsg"),
     };
-    let fds = fds
-        .into_iter()
-        .map(|fd| unsafe { OwnedFd::from_raw_fd(fd) })
-        .collect::<Vec<_>>();
-    fds.try_into()
-        .map_err(|_| anyhow!("received fds but not a tripe"))
+    if fds.len() != 3 {
+        bail!("received fds but not a tripe")
+    }
+
+    Ok([fds[0], fds[1], fds[2]])
 }
 
 /// Waits for readable data on fd
-fn wait_fds(fd: BorrowedFd, timeout: Option<Duration>) -> Result<bool> {
+fn wait_fds(fd: RawFd, timeout: Option<Duration>) -> Result<bool> {
     let poller = Poller::new()?;
-    let mut events = Events::with_capacity(NonZeroUsize::MIN);
-    unsafe { poller.add(fd.as_raw_fd(), Event::readable(0))? };
+    let mut events = Vec::with_capacity(1);
+    poller.add(fd, Event::readable(0))?;
     loop {
         match poller.wait(&mut events, timeout) {
             Ok(0) => return Ok(false),
@@ -57,7 +55,7 @@ fn wait_fds(fd: BorrowedFd, timeout: Option<Duration>) -> Result<bool> {
 /// Handles an unlimited amount of system calls, until timeout is reached
 ///
 /// Returns the amount of executed system calls
-pub fn handle(fd: BorrowedFd, timeout: Option<Duration>) -> Result<u32> {
+pub fn handle(fd: RawFd, timeout: Option<Duration>) -> Result<u32> {
     let start = Instant::now();
     let mut nsyscalls: u32 = 0;
 
@@ -78,9 +76,10 @@ pub fn handle(fd: BorrowedFd, timeout: Option<Duration>) -> Result<u32> {
             assert!(res);
         }
 
-        let [requ_fd, resp_fd, event_fd] = recv_fd_triple(fd)?;
-        let mut requ_fd = Mfd::from_fd(requ_fd)?;
-        let mut resp_fd = Mfd::from_fd(resp_fd)?;
+        let fds = recv_fd_triple(fd)?;
+        let mut requ_fd = Mfd::from_fd(fds[0])?;
+        let mut resp_fd = Mfd::from_fd(fds[1])?;
+        let event_fd = fds[2];
 
         // Fetch the request
         let requ = SyscallRequ::deserialize(&requ_fd.read_all()?)?;
@@ -96,7 +95,7 @@ pub fn handle(fd: BorrowedFd, timeout: Option<Duration>) -> Result<u32> {
 
         // Trigger the event
         let buf = 1_u64.to_ne_bytes();
-        unistd::write(event_fd.as_raw_fd(), &buf)?;
+        unistd::write(event_fd, &buf)?;
 
         nsyscalls += 1;
     }
@@ -107,7 +106,6 @@ pub fn handle(fd: BorrowedFd, timeout: Option<Duration>) -> Result<u32> {
 #[cfg(test)]
 mod tests {
     use std::io::IoSlice;
-    use std::os::fd::{AsFd, AsRawFd};
 
     use a653rs_linux_core::syscall::ApexSyscall;
     use nix::sys::eventfd::{eventfd, EfdFlags};
@@ -147,24 +145,18 @@ mod tests {
 
             // Send the fds to the responder
             {
-                let fds = [
-                    requ_fd.as_raw_fd(),
-                    resp_fd.as_raw_fd(),
-                    event_fd.as_raw_fd(),
-                ];
+                let fds = [requ_fd.get_fd(), resp_fd.get_fd(), event_fd];
                 let cmsg = [ControlMessage::ScmRights(&fds)];
                 let buffer = 0_u64.to_be_bytes();
                 let iov = [IoSlice::new(buffer.as_slice())];
-                sendmsg::<()>(requester.as_raw_fd(), &iov, &cmsg, MsgFlags::empty(), None).unwrap();
+                sendmsg::<()>(requester, &iov, &cmsg, MsgFlags::empty(), None).unwrap();
             }
 
             // Wait for a response
             {
                 let poller = Poller::new().unwrap();
-                let mut events = Events::with_capacity(NonZeroUsize::MIN);
-                unsafe {
-                    poller.add(&event_fd, Event::readable(0)).unwrap();
-                }
+                let mut events = Vec::with_capacity(1);
+                poller.add(event_fd, Event::readable(0)).unwrap();
                 poller.wait(&mut events, None).unwrap();
                 assert_eq!(events.len(), 1);
             }
@@ -175,7 +167,7 @@ mod tests {
         });
 
         let response_thread = std::thread::spawn(move || {
-            let n = handle(responder.as_fd(), Some(Duration::from_secs(1))).unwrap();
+            let n = handle(responder, Some(Duration::from_secs(1))).unwrap();
             assert_eq!(n, 1);
         });
 

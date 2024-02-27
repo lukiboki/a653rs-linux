@@ -14,7 +14,7 @@ use std::net::{TcpStream, UdpSocket};
 #[cfg(feature = "socket")]
 use a653rs_linux_core::ipc::IoReceiver;
 
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::RawFd;
 use std::os::unix::prelude::FromRawFd;
 use std::time::{Duration, Instant};
 
@@ -107,7 +107,7 @@ pub(crate) static SIGNAL_STACK: Lazy<MmapMut> = Lazy::new(|| {
         .unwrap()
 });
 
-pub(crate) static SYSCALL: Lazy<OwnedFd> = Lazy::new(|| {
+pub(crate) static SYSCALL: Lazy<RawFd> = Lazy::new(|| {
     let syscall_socket = socket::socket(
         AddressFamily::Unix,
         SockType::Datagram,
@@ -116,11 +116,7 @@ pub(crate) static SYSCALL: Lazy<OwnedFd> = Lazy::new(|| {
     )
     .unwrap();
 
-    connect(
-        syscall_socket.as_raw_fd(),
-        &UnixAddr::new(SYSCALL_SOCKET_PATH).unwrap(),
-    )
-    .unwrap();
+    connect(syscall_socket, &UnixAddr::new(SYSCALL_SOCKET_PATH).unwrap()).unwrap();
 
     syscall_socket
 });

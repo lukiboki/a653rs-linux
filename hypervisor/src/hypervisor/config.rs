@@ -53,15 +53,12 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use a653rs::bindings::PartitionId;
-use anyhow::anyhow;
-use serde::{Deserialize, Serialize};
-
 use a653rs_linux_core::channel::{QueuingChannelConfig, SamplingChannelConfig};
 use a653rs_linux_core::error::{ResultExt, SystemError, TypedResult};
 use a653rs_linux_core::health::{ModuleInitHMTable, ModuleRunHMTable, PartitionHMTable};
-
-use crate::hypervisor::scheduler::{PartitionSchedule, ScheduledTimeframe};
+use anyhow::anyhow;
+use itertools::Itertools;
+use serde::{Deserialize, Serialize};
 
 /// Main configuration of the hypervisor
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -104,7 +101,7 @@ pub struct Config {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Partition {
     /// Partition id
-    pub id: PartitionId,
+    pub id: i64,
 
     /// Partition name, used for example as prefix in the log printing
     pub name: String,
@@ -139,10 +136,6 @@ pub struct Partition {
     ///
     /// Use this to expose a path / file / device file from the host environment
     /// to the inside of a partitions.
-    ///
-    /// Both pats must be absolute. The first specifies a source file/directory
-    /// in the host environment. The second one specifies the target in the
-    /// partition environment.
     #[serde(default)]
     pub mounts: Vec<(PathBuf, PathBuf)>,
 
@@ -197,7 +190,7 @@ pub enum ModuleStates {
 }
 
 impl Config {
-    pub(crate) fn generate_schedule(&self) -> TypedResult<PartitionSchedule> {
+    pub(crate) fn generate_schedule(&self) -> TypedResult<Vec<(Duration, Duration, String)>> {
         // Verify Periods and Major Frame
         let lcm_periods = self
             .partitions
@@ -213,22 +206,27 @@ impl Config {
         }
 
         // Generate Schedule
-        let timeframes = self
+        let mut s = self
             .partitions
             .iter()
             .flat_map(|p| {
                 let pimf = (self.major_frame.as_nanos() / p.period.as_nanos()) as u32;
                 (0..pimf).map(|i| {
                     let start = p.offset + (p.period * i);
-                    ScheduledTimeframe {
-                        start,
-                        end: start + p.duration,
-                        partition: p.id,
-                    }
+                    (start, start + p.duration, p.name.clone())
                 })
             })
             .collect::<Vec<_>>();
+        s.sort_by(|(d1, ..), (d2, ..)| d1.cmp(d2));
 
-        PartitionSchedule::from_timeframes(timeframes).typ(SystemError::PartitionConfig)
+        // Verify no overlaps
+        for ((pstart, pend, pname), (nstart, nend, nname)) in s.iter().tuple_windows() {
+            if pend > nstart {
+                return Err(anyhow!("Overlapping Partition Windows: {pname} (start: {pstart:?}, end: {pend:?}). {nname} (start: {nstart:?}, end: {nend:?})"))
+                    .typ(SystemError::PartitionConfig);
+            }
+        }
+
+        Ok(s)
     }
 }

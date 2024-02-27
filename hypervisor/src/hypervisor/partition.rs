@@ -1,44 +1,38 @@
 use std::collections::HashMap;
+use std::fs;
 use std::net::{TcpStream, UdpSocket};
 use std::os::unix::prelude::{AsRawFd, FromRawFd, OwnedFd, PermissionsExt, RawFd};
 use std::path::{self, Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::thread::sleep;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use a653rs::bindings::{PartitionId, PortDirection};
+use a653rs::bindings::PortDirection;
 use a653rs::prelude::{OperatingMode, StartCondition};
-use anyhow::{anyhow, Context};
-use clone3::Clone3;
-use itertools::Itertools;
-use nix::mount::{umount2, MntFlags, MsFlags};
-use nix::sys::socket::{self, bind, AddressFamily, SockFlag, SockType, UnixAddr};
-use nix::unistd::{chdir, close, pivot_root, setgid, setuid, Gid, Pid, Uid};
-use polling::{Event, Events, Poller};
-use procfs::process::Process;
-use tempfile::{tempdir, TempDir};
-
 use a653rs_linux_core::cgroup::CGroup;
 use a653rs_linux_core::error::{
-    ErrorLevel, LeveledResult, ResultExt, SystemError, TypedError, TypedResult, TypedResultExt,
+    ErrorLevel, LeveledResult, ResultExt, SystemError, TypedResult, TypedResultExt,
 };
 use a653rs_linux_core::file::TempFile;
-use a653rs_linux_core::health::{ModuleRecoveryAction, PartitionHMTable, RecoveryAction};
+use a653rs_linux_core::health::PartitionHMTable;
 use a653rs_linux_core::health_event::PartitionCall;
 use a653rs_linux_core::ipc::{channel_pair, io_pair, IoReceiver, IoSender, IpcReceiver};
 use a653rs_linux_core::partition::{PartitionConstants, SamplingConstant};
 use a653rs_linux_core::sampling::Sampling;
 use a653rs_linux_core::syscall::SYSCALL_SOCKET_PATH;
-pub use mounting::FileMounter;
-
-use crate::hypervisor::config::Partition as PartitionConfig;
-use crate::hypervisor::SYSTEM_START_TIME;
-use crate::problem;
+use anyhow::{anyhow, bail};
+use clone3::Clone3;
+use itertools::Itertools;
+use nix::mount::{mount, umount2, MntFlags, MsFlags};
+use nix::sys::socket::{self, bind, AddressFamily, SockFlag, SockType, UnixAddr};
+use nix::unistd::{chdir, close, pivot_root, setgid, setuid, Gid, Pid, Uid};
+use procfs::process::Process;
+use tempfile::{tempdir, TempDir};
 
 use super::config::PosixSocket;
-use super::scheduler::Timeout;
-
-mod mounting;
+use super::scheduler::{PartitionTimeWindow, Timeout};
+use crate::hypervisor::config::Partition as PartitionConfig;
+use crate::hypervisor::linux::SYSTEM_START_TIME;
+use crate::problem;
 
 #[derive(Debug, Clone, Copy)]
 pub enum TransitionAction {
@@ -46,6 +40,18 @@ pub enum TransitionAction {
     Normal,
     Restart,
     Error,
+}
+
+// Information about the files that are to be mounted
+#[derive(Debug)]
+pub struct FileMounter {
+    pub source: Option<PathBuf>,
+    pub target: PathBuf,
+    pub fstype: Option<String>,
+    pub flags: MsFlags,
+    pub data: Option<String>,
+    // TODO: Find a way to get rid of this boolean
+    pub is_dir: bool, // Use File::create or fs::create_dir_all
 }
 
 // Struct for holding information of a partition which is not in Idle Mode
@@ -68,6 +74,69 @@ pub(crate) struct Run {
     // before the partition has received them.
     _io_udp_tx: IoSender<UdpSocket>,
     _io_tcp_tx: IoSender<TcpStream>,
+}
+
+impl FileMounter {
+    // Mount (and consume) a device
+    pub fn mount(self, base_dir: &Path) -> anyhow::Result<()> {
+        let target: &PathBuf = &base_dir.join(self.target);
+        let fstype = self.fstype.map(PathBuf::from);
+        let data = self.data.map(PathBuf::from);
+
+        if self.is_dir {
+            trace!("Creating directory {}", target.display());
+            fs::create_dir_all(target)?;
+        } else {
+            // It is okay to use .unwrap() here.
+            // It will only fail due to a developer mistake, not due to a user mistake.
+            let parent = target.parent().unwrap();
+            trace!("Creating directory {}", parent.display());
+            fs::create_dir_all(parent)?;
+
+            trace!("Creating file {}", target.display());
+            fs::File::create(target)?;
+        }
+
+        mount::<PathBuf, PathBuf, PathBuf, PathBuf>(
+            self.source.as_ref(),
+            target,
+            fstype.as_ref(),
+            self.flags,
+            data.as_ref(),
+        )?;
+
+        anyhow::Ok(())
+    }
+}
+
+impl TryFrom<&(PathBuf, PathBuf)> for FileMounter {
+    type Error = anyhow::Error;
+
+    fn try_from(paths: &(PathBuf, PathBuf)) -> Result<Self, Self::Error> {
+        let source = &paths.0;
+        let mut target = paths.1.clone();
+
+        if !source.exists() {
+            bail!("File/Directory {} not existent", source.display())
+        }
+
+        if target.is_absolute() {
+            // Convert absolute paths into relative ones.
+            // Otherwise we will receive a permission error.
+            // TODO: Make this a function?
+            target = target.strip_prefix("/")?.into();
+            assert!(target.is_relative());
+        }
+
+        Ok(Self {
+            source: Some(source.clone()),
+            target,
+            fstype: None,
+            flags: MsFlags::MS_BIND,
+            data: None,
+            is_dir: source.is_dir(),
+        })
+    }
 }
 
 impl Run {
@@ -161,74 +230,61 @@ impl Run {
                 // Mount the required mounts
                 let mut mounts = vec![
                     // Mount working directory as tmpfs
-                    FileMounter::new(
-                        None,
-                        "".into(),
-                        Some("tmpfs".into()),
-                        MsFlags::empty(),
-                        Some("size=500k".to_owned()),
-                    )
-                    .unwrap(),
+                    FileMounter {
+                        source: None,
+                        target: "".into(),
+                        fstype: Some("tmpfs".into()),
+                        flags: MsFlags::empty(),
+                        data: Some("size=500k".into()),
+                        is_dir: true,
+                    },
                     // Mount binary
-                    FileMounter::new(
-                        Some(base.bin.clone()),
-                        "bin".into(),
-                        None,
-                        MsFlags::MS_RDONLY | MsFlags::MS_BIND,
-                        None,
-                    )
-                    .unwrap(),
+                    FileMounter {
+                        source: Some(base.bin.clone()),
+                        target: "bin".into(),
+                        fstype: None,
+                        flags: MsFlags::MS_RDONLY | MsFlags::MS_BIND,
+                        data: None,
+                        is_dir: false,
+                    },
                     // Mount /dev/null (for stdio::null)
-                    FileMounter::new(
-                        Some("/dev/null".into()),
-                        "dev/null".into(),
-                        None,
-                        MsFlags::MS_RDONLY | MsFlags::MS_BIND,
-                        None,
-                    )
-                    .unwrap(),
+                    FileMounter {
+                        source: Some("/dev/null".into()),
+                        target: "dev/null".into(),
+                        fstype: None,
+                        flags: MsFlags::MS_RDONLY | MsFlags::MS_BIND,
+                        data: None,
+                        is_dir: false,
+                    },
                     // Mount proc
-                    FileMounter::new(
-                        Some("/proc".into()),
-                        "proc".into(),
-                        Some("proc".into()),
-                        MsFlags::empty(),
-                        None,
-                    )
-                    .unwrap(),
+                    FileMounter {
+                        source: Some("/proc".into()),
+                        target: "proc".into(),
+                        fstype: Some("proc".into()),
+                        flags: MsFlags::empty(),
+                        data: None,
+                        is_dir: true,
+                    },
                     // Mount CGroup v2
-                    FileMounter::new(
-                        None,
-                        "sys/fs/cgroup".into(),
-                        Some("cgroup2".into()),
-                        MsFlags::empty(),
-                        None,
-                    )
-                    .unwrap(),
+                    FileMounter {
+                        source: None,
+                        target: "sys/fs/cgroup".into(),
+                        fstype: Some("cgroup2".into()),
+                        flags: MsFlags::empty(),
+                        data: None,
+                        is_dir: true,
+                    },
                 ];
 
-                for (source, target) in base.mounts.iter().cloned() {
-                    // make target path relative because they will later be appended to the
-                    // partition's base directory by the `FileMounter`
-                    let relative_target = target
-                        .strip_prefix("/")
-                        .context("target paths for mounting must be absolute")
-                        .typ(SystemError::Panic)?
-                        .to_path_buf();
-
-                    let file_mounter = FileMounter::from_paths(source, relative_target)
-                        .context("failed to initialize file mounter")
-                        .typ(SystemError::Panic)?;
-                    mounts.push(file_mounter);
+                for m in &base.mounts {
+                    mounts.push(m.try_into().unwrap());
                 }
 
                 // TODO: Check for duplicate mounts
 
                 for m in mounts {
                     debug!("mounting {:?}", &m);
-                    m.mount(base.working_dir.path())
-                        .context("failed to mount")
-                        .typ(SystemError::Panic)?;
+                    m.mount(base.working_dir.path()).unwrap();
                 }
 
                 // Change working directory and root (unmount old root)
@@ -248,11 +304,7 @@ impl Run {
                 )
                 .unwrap();
 
-                bind(
-                    syscall_socket.as_raw_fd(),
-                    &UnixAddr::new(SYSCALL_SOCKET_PATH).unwrap(),
-                )
-                .unwrap();
+                bind(syscall_socket, &UnixAddr::new(SYSCALL_SOCKET_PATH).unwrap()).unwrap();
 
                 let constants: RawFd = PartitionConstants {
                     name: base.name.clone(),
@@ -496,7 +548,7 @@ fn send_sockets(base: &Base) -> Result<IoTxRx, a653rs_linux_core::error::TypedEr
 pub(crate) struct Base {
     name: String,
     hm: PartitionHMTable,
-    id: PartitionId,
+    id: i64,
     bin: PathBuf,
     mounts: Vec<(PathBuf, PathBuf)>,
     cgroup: CGroup,
@@ -620,8 +672,25 @@ impl Partition {
         }
     }
 
-    pub fn get_base_run(&mut self) -> (&Base, &mut Run) {
-        (&self.base, &mut self.run)
+    pub fn run(
+        &mut self,
+        sampling: &mut HashMap<String, Sampling>,
+        timeout: Timeout,
+    ) -> LeveledResult<()> {
+        PartitionTimeWindow::new(&self.base, &mut self.run, timeout).run()?;
+        // TODO Error handling and freeze if err
+        self.base.freeze().lev(ErrorLevel::Partition)?;
+
+        for (name, _) in self
+            .base
+            .sampling_channel
+            .iter()
+            .filter(|(_, s)| s.dir == PortDirection::Source)
+        {
+            sampling.get_mut(name).unwrap().swap();
+        }
+
+        Ok(())
     }
 
     //fn idle_transition(mut self) -> Result<()> {
@@ -644,224 +713,6 @@ impl Partition {
 
     pub(crate) fn rm(self) -> TypedResult<()> {
         self.base.cgroup.rm().typ(SystemError::CGroup)
-    }
-
-    pub fn run_post_timeframe(&mut self, sampling_channels: &mut HashMap<String, Sampling>) {
-        // TODO remove because a base freeze is not necessary here, as all run_* methods
-        // should freeze base themself after execution. Before removal of this, check
-        // all run_* methods.
-        let _ = self.base.freeze();
-
-        for (name, _) in self
-            .base
-            .sampling_channel
-            .iter()
-            .filter(|(_, s)| s.dir == PortDirection::Source)
-        {
-            sampling_channels.get_mut(name).unwrap().swap();
-        }
-    }
-
-    /// Executes the periodic process for a maximum duration specified through
-    /// the `timeout` parameter. Returns whether the periodic process exists
-    /// and was run.
-    pub fn run_periodic_process(&mut self, timeout: Timeout) -> TypedResult<bool> {
-        match self.run.unfreeze_periodic() {
-            Ok(true) => {}
-            other => return other,
-        }
-
-        let mut poller = PeriodicPoller::new(&self.run)?;
-
-        self.base.unfreeze()?;
-
-        while timeout.has_time_left() {
-            let event = poller.wait_timeout(&mut self.run, timeout)?;
-            match &event {
-                PeriodicEvent::Timeout => {}
-                PeriodicEvent::Frozen => {
-                    self.base.freeze()?;
-
-                    return Ok(true);
-                }
-                // TODO Error Handling with HM
-                PeriodicEvent::Call(e @ PartitionCall::Error(se)) => {
-                    e.print_partition_log(self.base.name());
-                    match self.base.part_hm().try_action(*se) {
-                        Some(RecoveryAction::Module(ModuleRecoveryAction::Ignore)) => {}
-                        Some(_) => {
-                            return Err(TypedError::new(*se, anyhow!("Received Partition Error")))
-                        }
-                        None => {
-                            return Err(TypedError::new(
-                                SystemError::Panic,
-                                anyhow!(
-                                "Could not get recovery action for requested partition error: {se}"
-                            ),
-                            ))
-                        }
-                    };
-                }
-                PeriodicEvent::Call(c @ PartitionCall::Message(_)) => {
-                    c.print_partition_log(self.base.name())
-                }
-                PeriodicEvent::Call(PartitionCall::Transition(mode)) => {
-                    // Only exit run_periodic, if we changed our mode
-                    if self.run.handle_transition(&self.base, *mode)?.is_some() {
-                        return Ok(true);
-                    }
-                }
-            }
-        }
-
-        // TODO being here means that we exceeded the timeout
-        // So we should return a SystemError stating that the time was exceeded
-        Ok(true)
-    }
-
-    pub fn run_aperiodic_process(&mut self, timeout: Timeout) -> TypedResult<bool> {
-        match self.run.unfreeze_aperiodic() {
-            Ok(true) => {}
-            other => return other,
-        }
-
-        // Did we even need to unfreeze aperiodic?
-        self.base.unfreeze()?;
-
-        while timeout.has_time_left() {
-            match &self
-                .run
-                .receiver()
-                .try_recv_timeout(timeout.remaining_time())?
-            {
-                Some(m @ PartitionCall::Message(_)) => m.print_partition_log(self.base.name()),
-                Some(e @ PartitionCall::Error(se)) => {
-                    e.print_partition_log(self.base.name());
-                    match self.base.part_hm().try_action(*se) {
-                        Some(RecoveryAction::Module(ModuleRecoveryAction::Ignore)) => {}
-                        Some(_) => {
-                            return Err(TypedError::new(*se, anyhow!("Received Partition Error")))
-                        }
-                        None => {
-                            return Err(TypedError::new(
-                                SystemError::Panic,
-                                anyhow!(
-                                "Could not get recovery action for requested partition error: {se}"
-                            ),
-                            ))
-                        }
-                    };
-                }
-                Some(t @ PartitionCall::Transition(mode)) => {
-                    // In case of a transition to idle, just sleep. Do not care for the rest
-                    t.print_partition_log(self.base.name());
-                    if let Some(OperatingMode::Idle) =
-                        self.run.handle_transition(&self.base, *mode)?
-                    {
-                        sleep(timeout.remaining_time());
-                        return Ok(true);
-                    }
-                }
-                None => {}
-            }
-        }
-
-        self.run.freeze_aperiodic()?;
-
-        Ok(true)
-    }
-
-    /// Currently the same as run_aperiodic
-    pub fn run_start(&mut self, timeout: Timeout, _warm_start: bool) -> TypedResult<()> {
-        self.base.unfreeze()?;
-
-        while timeout.has_time_left() {
-            match &self
-                .run
-                .receiver()
-                .try_recv_timeout(timeout.remaining_time())?
-            {
-                Some(m @ PartitionCall::Message(_)) => m.print_partition_log(self.base.name()),
-                Some(e @ PartitionCall::Error(se)) => {
-                    e.print_partition_log(self.base.name());
-                    match self.base.part_hm().try_action(*se) {
-                        Some(RecoveryAction::Module(ModuleRecoveryAction::Ignore)) => {}
-                        Some(_) => {
-                            return Err(TypedError::new(*se, anyhow!("Received Partition Error")))
-                        }
-                        None => {
-                            return Err(TypedError::new(
-                                SystemError::Panic,
-                                anyhow!(
-                                "Could not get recovery action for requested partition error: {se}"
-                            ),
-                            ))
-                        }
-                    };
-                }
-                Some(t @ PartitionCall::Transition(mode)) => {
-                    // In case of a transition to idle, just sleep. Do not care for the rest
-                    t.print_partition_log(self.base.name());
-                    if let Some(OperatingMode::Idle) =
-                        self.run.handle_transition(&self.base, *mode)?
-                    {
-                        sleep(timeout.remaining_time());
-                        return Ok(());
-                    }
-                }
-                None => {}
-            }
-        }
-
-        self.base.freeze()
-    }
-
-    /// Handles an error that occurred during self.run_* methods.
-    pub fn handle_error(&mut self, err: TypedError) -> LeveledResult<()> {
-        debug!("Partition \"{}\" received err: {err:?}", self.base.name());
-
-        let now = Instant::now();
-
-        let action = match self.base.part_hm().try_action(err.err()) {
-            None => {
-                warn!("Could not map \"{err:?}\" to action. Using Panic action instead");
-                match self.base.part_hm().panic {
-                    // We do not Handle Module Recovery actions here
-                    RecoveryAction::Module(_) => {
-                        return TypedResult::Err(err).lev(ErrorLevel::Partition)
-                    }
-                    RecoveryAction::Partition(action) => action,
-                }
-            }
-            // We do not Handle Module Recovery actions here
-            Some(RecoveryAction::Module(_)) => {
-                return TypedResult::Err(err).lev(ErrorLevel::Partition)
-            }
-            Some(RecoveryAction::Partition(action)) => action,
-        };
-
-        debug!("Handling: {err:?}");
-        debug!("Apply Partition Recovery Action: {action:?}");
-
-        // TODO do not unwrap/expect these errors. Maybe raise Module Level
-        // PartitionInit Error?
-        match action {
-            a653rs_linux_core::health::PartitionRecoveryAction::Idle => self
-                .run
-                .idle_transition(&self.base)
-                .expect("Idle Transition Failed"),
-            a653rs_linux_core::health::PartitionRecoveryAction::ColdStart => self
-                .run
-                .start_transition(&self.base, false, StartCondition::HmPartitionRestart)
-                .expect("Start(Cold) Transition Failed"),
-            a653rs_linux_core::health::PartitionRecoveryAction::WarmStart => self
-                .run
-                .start_transition(&self.base, false, StartCondition::HmPartitionRestart)
-                .expect("Start(Warm) Transition Failed"),
-        }
-
-        trace!("Partition Error Handling took: {:?}", now.elapsed());
-        Ok(())
     }
 }
 
@@ -920,90 +771,5 @@ impl PartitionConfig {
         };
 
         Ok(bin)
-    }
-}
-
-pub(crate) struct PeriodicPoller {
-    poll: Poller,
-    events: OwnedFd,
-}
-
-pub enum PeriodicEvent {
-    Timeout,
-    Frozen,
-    Call(PartitionCall),
-}
-
-impl PeriodicPoller {
-    const EVENTS_ID: usize = 1;
-    const RECEIVER_ID: usize = 2;
-
-    pub fn new(run: &Run) -> TypedResult<PeriodicPoller> {
-        let events = run.periodic_events()?;
-
-        let poll = Poller::new().typ(SystemError::Panic)?;
-        unsafe {
-            poll.add(events.as_raw_fd(), Event::readable(Self::EVENTS_ID))
-                .typ(SystemError::Panic)?;
-            poll.add(
-                run.receiver().as_raw_fd(),
-                Event::readable(Self::RECEIVER_ID),
-            )
-            .typ(SystemError::Panic)?;
-        }
-
-        Ok(PeriodicPoller { poll, events })
-    }
-
-    pub fn wait_timeout(&mut self, run: &mut Run, timeout: Timeout) -> TypedResult<PeriodicEvent> {
-        if run.is_periodic_frozen()? {
-            return Ok(PeriodicEvent::Frozen);
-        }
-
-        while timeout.has_time_left() {
-            let mut events = Events::new();
-            self.poll
-                .wait(&mut events, Some(timeout.remaining_time()))
-                .typ(SystemError::Panic)?;
-
-            for e in events.iter() {
-                match e.key {
-                    // Got a Frozen event
-                    Self::EVENTS_ID => {
-                        // Re-sub the readable event
-                        self.poll
-                            .modify(&mut self.events, Event::readable(Self::EVENTS_ID))
-                            .typ(SystemError::Panic)?;
-
-                        // Then check if the cg is actually frozen
-                        if run.is_periodic_frozen()? {
-                            return Ok(PeriodicEvent::Frozen);
-                        }
-                    }
-                    // got a call events
-                    Self::RECEIVER_ID => {
-                        // Re-sub the readable event
-                        // This will result in the event instantly being ready again should we have
-                        // something to read, but that is better than
-                        // accidentally missing an event (at the expense of one extra loop per
-                        // receive)
-                        self.poll
-                            .modify(run.receiver(), Event::readable(Self::RECEIVER_ID))
-                            .typ(SystemError::Panic)?;
-
-                        // Now receive anything
-                        if let Some(call) = run.receiver().try_recv()? {
-                            return Ok(PeriodicEvent::Call(call));
-                        }
-                    }
-                    _ => {
-                        return Err(anyhow!("Unexpected Event Received: {e:?}"))
-                            .typ(SystemError::Panic)
-                    }
-                }
-            }
-        }
-
-        Ok(PeriodicEvent::Timeout)
     }
 }
