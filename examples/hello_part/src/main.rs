@@ -4,6 +4,7 @@ use a653rs_linux::partition::ApexLogger;
 use log::LevelFilter;
 mod beispiel_bojan;
 use beispiel_bojan::src::main;
+use main::calc_adv;
 
 fn main() {
     ApexLogger::install_panic_hook();
@@ -16,11 +17,12 @@ fn main() {
 mod hello {
     use core::time::Duration;
     use std::thread::sleep;
-
+    use crate::calc_adv;
+    
     /*
     use a653rs_postcard::prelude::*;
-    */
     use humantime::format_duration;
+    */
     use log::*;
     use serde::{Deserialize, Serialize};
 
@@ -57,17 +59,8 @@ mod hello {
     fn aperiodic_process(_ctx: aperiodic_process::Context) {
         loop {
             info!("Start Aperiodic");
-            sleep(Duration::from_millis(1));
+            sleep(Duration::from_millis(3));
         }
-        /* 
-        for i in 0..i32::MAX {
-            if let SystemTime::Normal(time) = ctx.get_time() {
-                let round = Duration::from_millis(time.as_millis() as u64);
-                info!("{:?}: AP MSG {i}", format_duration(round).to_string());
-            }
-            sleep(Duration::from_millis(1))
-        }
-        */
     }
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -86,23 +79,8 @@ mod hello {
     fn periodic_process(ctx: periodic_process::Context) {
         loop {
             info!("Start Periodic");
-            ctx.periodic_wait();
+            info!("{:?}", calc_adv());
+            let _ = ctx.periodic_wait();
         }
-        /* 
-        for i in 0..i32::MAX {
-            if let SystemTime::Normal(time) = ctx.get_time() {
-                let round = Duration::from_millis(time.as_millis() as u64);
-                info!("{:?}: AP MSG {i}", format_duration(round).to_string());
-            }
-            sleep(Duration::from_millis(1))
-        }
-        */
-        /*
-        info!("Start Periodic");
-        use crate::main;
-        let calc_adv = main::calc_adv();
-        calc_adv;
-        println!("Test \n\n\n");
-        */
     }
 }

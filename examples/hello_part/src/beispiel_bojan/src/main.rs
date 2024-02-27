@@ -10,8 +10,7 @@ use uom::si::velocity::{foot_per_minute, foot_per_second};
 fn main() {}
 */
 
-pub fn calc_adv() {
-    println!("Calculation  \n\n\n");
+pub fn calc_adv() -> VAdvisory { 
     // init AircraftState struct
     let mut ownship = AircraftState {
         groundspeed: Velocity::new::<foot_per_second>(500.0),
@@ -31,29 +30,22 @@ pub fn calc_adv() {
         heading: Angle::new::<degree>(100.0),
     };
 
-    //  exemplary loop: no clue how you guys want to use this
-    loop {
-        // init opencas instance (here vcas) - default state is COC
-        let mut vcas = opencas::VCas {
-            last_advisory: VAdvisory::ClearOfConflict,
-        };
+    // init opencas instance (here vcas) - default state is COC
+    let mut vcas = opencas::VCas {
+        last_advisory: VAdvisory::ClearOfConflict,
+    };
 
-        // do your calculations needed for the network
-        let rel_altitude = cas_calculation::utils::relative_altitudes(&ownship, &intruder);
-        let tau_hori = cas_calculation::utils::calc_tau_horizontal(&ownship, &intruder);
+    // do your calculations needed for the network
+    let rel_altitude = cas_calculation::utils::relative_altitudes(&ownship, &intruder);
+    let tau_hori = cas_calculation::utils::calc_tau_horizontal(&ownship, &intruder);
 
-        // Do CAS inference for VCAS
-        let (vadvisory, _confidence) = vcas.process(
-            rel_altitude,
-            ownship.vertical_speed,
-            intruder.vertical_speed,
-            tau_hori,
-        );
-        println!("Current Advisory: {:#?}", vadvisory);
-
-        // save new advisory to last advisory for next cycle
-        vcas.last_advisory = vadvisory;
-
-        // update ownship and intruder for next cycle with newest situational data
-    }
+    // Do CAS inference for VCAS
+    let (vadvisory, _confidence) = vcas.process(
+        rel_altitude,
+        ownship.vertical_speed,
+        intruder.vertical_speed,
+        tau_hori,
+    );
+    println!("Current Advisory: {:#?}", vadvisory);
+    vadvisory
 }
